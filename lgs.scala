@@ -17,7 +17,7 @@ val separator = ";"
       .iterator
       .flatMap(fileParser)
       .filter(l => l.requestLogLine.isDefined)
-      .map(l => s"${l.timestamp}$separator${l.requestLogLine.get}")
+      .map(l => s"${l.timestamp}$separator${l.time}$separator${l.requestLogLine.get}")
       .foreach(println)
 }
 
@@ -29,30 +29,19 @@ def fileParser(file: File): Iterator[LogLine] =
 def lineParser =
   for {
     level <- takeWhile(_ != ' ')
-    timestamp <- takeWhile(_ != ' ').map { ts =>
-      ZonedDateTime.parse(ts, DateTimeFormatter.ISO_OFFSET_DATE_TIME).toInstant.toEpochMilli
-    }
+    time <- takeWhile(_ != ' ')
+    timestamp = ZonedDateTime.parse(time, DateTimeFormatter.ISO_OFFSET_DATE_TIME).toInstant.toEpochMilli
     _ <- extract(raw"(\[.*\]).*".r)
     from <- takeWhile(_ != ' ')
     rest <- State.get[String]
     requestLogLine = if from == "c.s.a.s.LoggingRequestEventListener" then
         Some(requestLogLineParser.run(rest)._2)
       else Option.empty[RequestLogLine]
-  } yield LogLine(level, timestamp, from, rest, requestLogLine)
+  } yield LogLine(level, timestamp, time, from, rest, requestLogLine)
 
 def requestLogLineParser =
   for {
-    requestId <- takeWhile(_ != ' ').map {
-      case rid if rid.startsWith("R^") =>
-        R(rid)
-      case rid if rid.startsWith("ScreenshotCapture^") =>
-        val parts = rid.split("\\*")
-        val screenshot = parts.find(_.startsWith("ScreenshotCapture^"))
-        val invocation = parts.find(_.startsWith("Invocation^"))
-        val r = parts.find(_.startsWith("R^"))
-        ScreenshotCapture(screenshot.get, invocation, R(r.get))
-      case rid => Other(rid)
-    }
+    requestId <- takeWhile(_ != ' ').map(parseRequestId)
     user <- takeWhile(_ != ' ')
     startFinish <- takeWhile(_ != ' ')
     results <- if startFinish == "Finish" then
@@ -64,9 +53,16 @@ def requestLogLineParser =
     (finishTime, status) = results
     _ <- takeWhile(_ != ' ')
     url <- takeWhile(_ != ' ')
-    metricsText <- State.get[String]
-    metrics = parseMetrics(metricsText)
+    metrics <- State.get[String].map(parseMetrics)
   } yield RequestLogLine(requestId, user, startFinish, finishTime, status, url, metrics)
+
+def parseRequestId(idText: String): RequestId = {
+  val parts = idText.split("\\*")
+  val screenshot = parts.find(_.startsWith("ScreenshotCapture^"))
+  val invocation = parts.find(_.startsWith("Invocation^"))
+  val request = parts.find(_.startsWith("R^"))
+  request.map(r => RequestId(screenshot, invocation, r)).getOrElse(RequestId(None, None, idText))
+}
 
 def parseMetrics(metricsText: String): Map[String, Double] =
   metricsText.split(" ")
@@ -94,6 +90,7 @@ def advance(v: String) =
 case class LogLine(
   level: String,
   timestamp: Long,
+  time: String,
   from: String,
   rest: String,
   requestLogLine: Option[RequestLogLine]
@@ -109,18 +106,28 @@ case class RequestLogLine(
   metrics: Map[String, Double]
 ) {
   override def toString =
-    s"""$requestId$separator$user$separator$startFinish$separator${finishTime.map(_.toString).getOrElse("")}$separator${status.getOrElse("")}$separator$url"""
+    s"""$requestId$separator$user$separator$startFinish$separator${finishTime.map(_.toString).getOrElse("")}$separator${status.getOrElse("")}$separator$url$separator$metricsToString"""
+
+  val metricsToString1 = metrics.toString
+
+  val metricsToString =
+    s"""${f("Datasource")}$separator${f("Cache")}$separator${f("Processing")}$separator${f("GC")}$separator${f("Request_Queue")}$separator""" +
+    s"""${f("Calc_Engine_Queue")}$separator${f("Seeq_Database")}$separator${f("Total")}$separator${f("Datasource_Samples_Read")}$separator""" +
+    s"""${f("Datasource_Capsules_Read")}$separator${f("Cache_Samples_Read")}$separator${f("Cache_Capsules_Read")}$separator""" +
+    s"""${f("Cache_In-Memory_Samples_Read")}$separator${f("Cache_In-Memory_Capsules_Read")}$separator${f("Database_Items_Read")}$separator""" +
+    s"""${f("Database_Relationships_Read")}$separator"""
+
+  def f(key: String): String =
+    metrics.get(key).map(_.toString).getOrElse("")
 }
 
-trait RequestId
-case class R(value: String) extends RequestId {
-  override def toString = s"$value$separator$separator"
-}
-case class ScreenshotCapture(id: String, invocation: Option[String], r: R) extends RequestId {
-  override def toString = s"""$id$separator${invocation.getOrElse("")}$separator$r"""
-}
-case class Other(value: String) extends RequestId {
-  override def toString = s"$value$separator$separator"
+case class RequestId(
+  screenshotCapture: Option[String],
+  invocation: Option[String],
+  r: String
+) {
+  override def toString =
+    s"""${screenshotCapture.getOrElse("")}$separator${invocation.getOrElse("")}$separator$r"""
 }
 
 case class State[S, A](run: S => (S, A)) {
